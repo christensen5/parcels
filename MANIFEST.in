@@ -1,0 +1,2 @@
+include versioneer.py
+include parcels/_version.py

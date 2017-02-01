@@ -1,3 +1,4 @@
+import versioneer
 try:
     from setuptools import setup, find_packages
 except ImportError:
@@ -5,7 +6,8 @@ except ImportError:
 import numpy as np
 
 setup(name='parcels',
-      version='0.0.1',
+      version=versioneer.get_version(),
+      cmdclass=versioneer.get_cmdclass(),
       long_description="Lagrangian particle tracking framework",
       long_description="""Framework for Lagrangian tracking of virtual
       ocean particles in the petascale age.""",
