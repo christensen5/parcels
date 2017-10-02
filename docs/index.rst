@@ -73,10 +73,11 @@ Installing Parcels
 ===================================
 
 The latest version of Parcels, including tests and examples, 
-can be obtained directly from github via::
+can be obtained directly from `github <https://github.com/OceanParcels/parcels/>`_ via::
     git clone https://github.com/OceanParcels/parcels.git
-    cd parcels; pip install -r requirements.txt
-    python scripts/pull_data.py
+    cd parcels
+    pip install -r requirements.txt
+    python parcels/scripts/pull_data.py
     export PYTHONPATH="$PYTHONPATH:$PWD"
 
 In order for Parcels to work from any directory, add the following line to 
