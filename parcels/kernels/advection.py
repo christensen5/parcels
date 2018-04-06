@@ -3,7 +3,7 @@ from parcels.kernels.error import ErrorCode
 import math
 
 
-__all__ = ['AdvectionRK4', 'AdvectionEE', 'AdvectionRK45', 'AdvectionRK4_3D']
+__all__ = ['AdvectionRK4', 'AdvectionEE', 'AdvectionEE_firedrake_3D', 'AdvectionRK45', 'AdvectionRK4_3D']
 
 
 def AdvectionRK4(particle, fieldset, time, dt):
@@ -54,6 +54,15 @@ def AdvectionEE(particle, fieldset, time, dt):
     (u1, v1) = fieldset.UV[time, particle.lon, particle.lat, particle.depth]
     particle.lon += u1 * dt
     particle.lat += v1 * dt
+
+
+def AdvectionEE_firedrake_3D(particle, fieldset, time, dt):
+    """Advection of particles using Explicit Euler (aka Euler Forward) integration, and with velocities
+    stored at the particle level."""
+    (u1, v1) = fieldset.UV[time, particle.lon, particle.lat, particle.depth]
+    particle.lon += particle.u * dt
+    particle.lat += particle.v * dt
+    particle.depth += particle.w * dt
 
 
 def AdvectionRK45(particle, fieldset, time, dt):
