@@ -380,7 +380,8 @@ class Field(object):
         if self._scaling_factor:
             raise NotImplementedError(('Scaling factor for field %s already defined.' % self.name))
         self._scaling_factor = factor
-        self.data *= factor
+        if not self.grid.defer_load:
+            self.data *= factor
 
     def getUV(self, time, x, y, z):
         fieldset = self.fieldset
@@ -1033,7 +1034,7 @@ class NetcdfFileBuffer(object):
             self.zdim = len(self.indsdepth)
         else:
             self.zdim = 0
-            self.indsdepth = []
+            self.indsdepth = [0]
         for inds in [self.indslat, self.indslon, self.indsdepth]:
             if type(inds) not in [list, range]:
                 raise RuntimeError('Indices for field subsetting need to be a list')
