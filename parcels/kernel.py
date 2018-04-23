@@ -240,6 +240,9 @@ class Kernel(object):
         recovery_map = recovery_base_map.copy()
         recovery_map.update(recovery)
 
+        # Remove all particles that signalled deletion
+        remove_deleted(pset)
+
         # Execute the kernel over the particle set
         if self.ptype.uses_jit:
             self.execute_jit(pset, endtime, dt)
