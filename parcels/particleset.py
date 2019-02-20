@@ -1,15 +1,16 @@
 from parcels.kernel import Kernel
-from parcels.field import Field, UnitConverter
 from parcels.particle import JITParticle
 from parcels.compiler import GNUCompiler
 from parcels.kernels.advection import AdvectionRK4
 from parcels.particlefile import ParticleFile
-from parcels.loggers import logger
+from parcels.tools.loggers import logger
+from parcels.grid import GridCode
 import numpy as np
-import bisect
+import progressbar
+import time as time_module
 from collections import Iterable
 from datetime import timedelta as delta
-from datetime import datetime
+from datetime import datetime, date
 
 __all__ = ['ParticleSet']
 
@@ -27,9 +28,10 @@ class ParticleSet(object):
     :param depth: Optional list of initial depth values for particles. Default is 0m
     :param time: Optional list of initial time values for particles. Default is fieldset.U.grid.time[0]
     :param repeatdt: Optional interval (in seconds) on which to repeat the release of the ParticleSet
+    Other Variables can be initialised using further arguments (e.g. v=... for a Variable named 'v')
     """
 
-    def __init__(self, fieldset, pclass=JITParticle, lon=[], lat=[], depth=None, time=None, repeatdt=None):
+    def __init__(self, fieldset, pclass=JITParticle, lon=None, lat=None, depth=None, time=None, repeatdt=None, **kwargs):
         self.fieldset = fieldset
         self.fieldset.check_complete()
 
@@ -40,17 +42,30 @@ class ParticleSet(object):
             elif isinstance(var, np.ndarray):
                 return var.flatten()
             return var
+        if lon is None:
+            lon = []
+        if lat is None:
+            lat = []
 
         lon = convert_to_list(lon)
         lat = convert_to_list(lat)
-        depth = np.ones(len(lon)) * fieldset.U.grid.depth[0] if depth is None else depth
+        if depth is None:
+            mindepth, _ = self.fieldset.gridset.dimrange('depth')
+            depth = np.ones(len(lon)) * mindepth
         depth = convert_to_list(depth)
         assert len(lon) == len(lat) and len(lon) == len(depth)
 
         time = time.tolist() if isinstance(time, np.ndarray) else time
         time = [time] * len(lat) if not isinstance(time, list) else time
-        time = [t.total_seconds() if isinstance(t, delta) else t for t in time]
-        time = [((np.datetime64(t) - fieldset.U.grid.time_origin) / np.timedelta64(1, 's')) if isinstance(t, datetime) else t for t in time]
+        time = [np.datetime64(t) if isinstance(t, datetime) else t for t in time]
+        time = [np.datetime64(t) if isinstance(t, date) else t for t in time]
+        self.time_origin = fieldset.time_origin
+        if len(time) > 0 and isinstance(time[0], np.timedelta64) and not self.time_origin:
+            raise NotImplementedError('If fieldset.time_origin is not a date, time of a particle must be a double')
+        time = [self.time_origin.reltime(t) if isinstance(t, np.datetime64) else t for t in time]
+
+        for kwvar in kwargs:
+            kwargs[kwvar] = convert_to_list(kwargs[kwvar])
 
         assert len(lon) == len(time)
 
@@ -65,12 +80,12 @@ class ParticleSet(object):
             self.repeatlat = lat
             self.repeatdepth = depth
             self.repeatpclass = pclass
+            self.repeatkwargs = kwargs
 
         size = len(lon)
         self.particles = np.empty(size, dtype=pclass)
         self.ptype = pclass.getPType()
         self.kernel = None
-        self.time_origin = fieldset.U.grid.time_origin
 
         if self.ptype.uses_jit:
             # Allocate underlying data for C-allocated particles
@@ -88,11 +103,16 @@ class ParticleSet(object):
 
             for i in range(size):
                 self.particles[i] = pclass(lon[i], lat[i], fieldset=fieldset, depth=depth[i], cptr=cptr(i), time=time[i])
+                # Set other Variables if provided
+                for kwvar in kwargs:
+                    if not hasattr(self.particles[i], kwvar):
+                        raise RuntimeError('Particle class does not have Variable %s' % kwvar)
+                    setattr(self.particles[i], kwvar, kwargs[kwvar][i])
         else:
             raise ValueError("Latitude and longitude required for generating ParticleSet")
 
     @classmethod
-    def from_list(cls, fieldset, pclass, lon, lat, depth=None, time=None, repeatdt=None):
+    def from_list(cls, fieldset, pclass, lon, lat, depth=None, time=None, repeatdt=None, **kwargs):
         """Initialise the ParticleSet from lists of lon and lat
 
         :param fieldset: :mod:`parcels.fieldset.FieldSet` object from which to sample velocity
@@ -103,8 +123,9 @@ class ParticleSet(object):
         :param depth: Optional list of initial depth values for particles. Default is 0m
         :param time: Optional list of start time values for particles. Default is fieldset.U.time[0]
         :param repeatdt: Optional interval (in seconds) on which to repeat the release of the ParticleSet
+        Other Variables can be initialised using further arguments (e.g. v=... for a Variable named 'v')
        """
-        return cls(fieldset=fieldset, pclass=pclass, lon=lon, lat=lat, depth=depth, time=time, repeatdt=repeatdt)
+        return cls(fieldset=fieldset, pclass=pclass, lon=lon, lat=lat, depth=depth, time=time, repeatdt=repeatdt, **kwargs)
 
     @classmethod
     def from_line(cls, fieldset, pclass, start, finish, size, depth=None, time=None, repeatdt=None):
@@ -124,6 +145,8 @@ class ParticleSet(object):
         """
         lon = np.linspace(start[0], finish[0], size, dtype=np.float32)
         lat = np.linspace(start[1], finish[1], size, dtype=np.float32)
+        if type(depth) in [int, float]:
+            depth = [depth] * size
         return cls(fieldset=fieldset, pclass=pclass, lon=lon, lat=lat, depth=depth, time=time, repeatdt=repeatdt)
 
     @classmethod
@@ -133,31 +156,46 @@ class ParticleSet(object):
         :param fieldset: :mod:`parcels.fieldset.FieldSet` object from which to sample velocity
         :param pclass: mod:`parcels.particle.JITParticle` or :mod:`parcels.particle.ScipyParticle`
                  object that defines custom particle
-        :param start_field: Field for initialising particles stochastically according to the presented density field.
+        :param start_field: Field for initialising particles stochastically (horizontally)  according to the presented density field.
         :param size: Initial size of particle set
         :param mode: Type of random sampling. Currently only 'monte_carlo' is implemented
         :param depth: Optional list of initial depth values for particles. Default is 0m
         :param time: Optional start time value for particles. Default is fieldset.U.time[0]
         :param repeatdt: Optional interval (in seconds) on which to repeat the release of the ParticleSet
         """
-        lonwidth = (start_field.grid.lon[1] - start_field.grid.lon[0]) / 2
-        latwidth = (start_field.grid.lat[1] - start_field.grid.lat[0]) / 2
-
-        def add_jitter(pos, width, min, max):
-            value = pos + np.random.uniform(-width, width)
-            while not (min <= value <= max):
-                value = pos + np.random.uniform(-width, width)
-            return value
 
         if mode == 'monte_carlo':
-            p = np.reshape(start_field.data, (1, start_field.data.size))
-            inds = np.random.choice(start_field.data.size, size, replace=True, p=p[0] / np.sum(p))
-            lat, lon = np.unravel_index(inds, start_field.data[0, :, :].shape)
-            lon = fieldset.U.grid.lon[lon]
-            lat = fieldset.U.grid.lat[lat]
-            for i in range(lon.size):
-                lon[i] = add_jitter(lon[i], lonwidth, start_field.grid.lon[0], start_field.grid.lon[-1])
-                lat[i] = add_jitter(lat[i], latwidth, start_field.grid.lat[0], start_field.grid.lat[-1])
+            if start_field.interp_method == 'cgrid_tracer':
+                p_interior = np.squeeze(start_field.data[0, 1:, 1:])
+            else:  # if A-grid
+                d = start_field.data
+                p_interior = (d[0, :-1, :-1] + d[0, 1:, :-1] + d[0, :-1, 1:] + d[0, 1:, 1:])/4.
+                p_interior = np.where(d[0, :-1, :-1] == 0, 0, p_interior)
+                p_interior = np.where(d[0, 1:, :-1] == 0, 0, p_interior)
+                p_interior = np.where(d[0, 1:, 1:] == 0, 0, p_interior)
+                p_interior = np.where(d[0, :-1, 1:] == 0, 0, p_interior)
+            p = np.reshape(p_interior, (1, p_interior.size))
+            inds = np.random.choice(p_interior.size, size, replace=True, p=p[0] / np.sum(p))
+            xsi = np.random.uniform(size=len(inds))
+            eta = np.random.uniform(size=len(inds))
+            j, i = np.unravel_index(inds, p_interior.shape)
+            grid = start_field.grid
+            if grid.gtype in [GridCode.RectilinearZGrid, GridCode.RectilinearSGrid]:
+                lon = grid.lon[i] + xsi * (grid.lon[i + 1] - grid.lon[i])
+                lat = grid.lat[j] + eta * (grid.lat[j + 1] - grid.lat[j])
+            else:
+                lons = np.array([grid.lon[j, i], grid.lon[j, i+1], grid.lon[j+1, i+1], grid.lon[j+1, i]])
+                if grid.mesh == 'spherical':
+                    lons[1:] = np.where(lons[1:] - lons[0] > 180, lons[1:]-360, lons[1:])
+                    lons[1:] = np.where(-lons[1:] + lons[0] > 180, lons[1:]+360, lons[1:])
+                lon = (1-xsi)*(1-eta) * lons[0] +\
+                    xsi*(1-eta) * lons[1] +\
+                    xsi*eta * lons[2] +\
+                    (1-xsi)*eta * lons[3]
+                lat = (1-xsi)*(1-eta) * grid.lat[j, i] +\
+                    xsi*(1-eta) * grid.lat[j, i+1] +\
+                    xsi*eta * grid.lat[j+1, i+1] +\
+                    (1-xsi)*eta * grid.lat[j+1, i]
         else:
             raise NotImplementedError('Mode %s not implemented. Please use "monte carlo" algorithm instead.' % mode)
 
@@ -212,7 +250,8 @@ class ParticleSet(object):
         return particles
 
     def execute(self, pyfunc=AdvectionRK4, endtime=None, runtime=None, dt=1.,
-                moviedt=None, recovery=None, output_file=None, movie_background_field=None):
+                moviedt=None, recovery=None, output_file=None, movie_background_field=None,
+                verbose_progress=None):
         """Execute a given kernel function over the particle set for
         multiple timesteps. Optionally also provide sub-timestepping
         for particle output.
@@ -232,11 +271,12 @@ class ParticleSet(object):
                          It is either a timedelta object or a positive double.
                          None value means no animation.
         :param output_file: :mod:`parcels.particlefile.ParticleFile` object for particle output
-        :param recovery: Dictionary with additional `:mod:parcels.kernels.error`
+        :param recovery: Dictionary with additional `:mod:parcels.tools.error`
                          recovery kernels to allow custom recovery behaviour in case of
                          kernel errors.
         :param movie_background_field: field plotted as background in the movie if moviedt is set.
                                        'vector' shows the velocity as a vector field.
+        :param verbose_progress: Boolean for providing a progress bar for the kernel execution loop.
 
         """
 
@@ -257,7 +297,11 @@ class ParticleSet(object):
         if isinstance(endtime, delta):
             raise RuntimeError('endtime must be either a datetime or a double')
         if isinstance(endtime, datetime):
-            endtime = (endtime - self.time_origin).total_seconds()
+            endtime = np.datetime64(endtime)
+        if isinstance(endtime, np.datetime64):
+            if self.time_origin.calendar is None:
+                raise NotImplementedError('If fieldset.time_origin is not a date, execution endtime must be a double')
+            endtime = self.time_origin.reltime(endtime)
         if isinstance(runtime, delta):
             runtime = runtime.total_seconds()
         if isinstance(dt, delta):
@@ -275,7 +319,8 @@ class ParticleSet(object):
         # Set particle.time defaults based on sign of dt, if not set at ParticleSet construction
         for p in self:
             if np.isnan(p.time):
-                p.time = self.fieldset.U.grid.time[0] if dt >= 0 else self.fieldset.U.grid.time[-1]
+                mintime, maxtime = self.fieldset.gridset.dimrange('time_full')
+                p.time = mintime if dt >= 0 else maxtime
 
         # Derive _starttime and endtime from arguments or fieldset defaults
         if runtime is not None and endtime is not None:
@@ -286,7 +331,8 @@ class ParticleSet(object):
         if runtime is not None:
             endtime = _starttime + runtime * np.sign(dt)
         elif endtime is None:
-            endtime = self.fieldset.U.grid.time[-1] if dt >= 0 else self.fieldset.U.grid.time[0]
+            mintime, maxtime = self.fieldset.gridset.dimrange('time_full')
+            endtime = maxtime if dt >= 0 else mintime
 
         if abs(endtime-_starttime) < 1e-5 or dt == 0 or runtime == 0:
             dt = 0
@@ -303,7 +349,7 @@ class ParticleSet(object):
         if output_file:
             output_file.write(self, _starttime)
         if moviedt:
-            self.show(field=movie_background_field, show_time=_starttime)
+            self.show(field=movie_background_field, show_time=_starttime, animation=True)
 
         if moviedt is None:
             moviedt = np.infty
@@ -311,13 +357,24 @@ class ParticleSet(object):
         if self.repeatdt:
             next_prelease = self.repeat_starttime + (abs(time - self.repeat_starttime) // self.repeatdt + 1) * self.repeatdt * np.sign(dt)
         else:
-            next_prelease = np.infty * np.sign(dt)
-        next_output = time + outputdt * np.sign(dt)
-        next_movie = time + moviedt * np.sign(dt)
+            next_prelease = np.infty if dt > 0 else - np.infty
+        next_output = time + outputdt if dt > 0 else time - outputdt
+        next_movie = time + moviedt if dt > 0 else time - moviedt
         next_input = self.fieldset.computeTimeChunk(time, np.sign(dt))
 
         tol = 1e-12
+        if verbose_progress is None:
+            walltime_start = time_module.time()
+        if verbose_progress:
+            try:
+                pbar = progressbar.ProgressBar(max_value=abs(endtime - _starttime)).start()
+            except:  # for old versions of progressbar
+                pbar = progressbar.ProgressBar(maxvalue=abs(endtime - _starttime)).start()
         while (time < endtime and dt > 0) or (time > endtime and dt < 0) or dt == 0:
+            if verbose_progress is None and time_module.time() - walltime_start > 10:
+                # Showing progressbar if runtime > 10 seconds
+                pbar = progressbar.ProgressBar(max_value=abs(endtime - _starttime)).start()
+                verbose_progress = True
             if dt > 0:
                 time = min(next_prelease, next_input, next_output, next_movie, endtime)
             else:
@@ -326,7 +383,7 @@ class ParticleSet(object):
             if abs(time-next_prelease) < tol:
                 pset_new = ParticleSet(fieldset=self.fieldset, time=time, lon=self.repeatlon,
                                        lat=self.repeatlat, depth=self.repeatdepth,
-                                       pclass=self.repeatpclass)
+                                       pclass=self.repeatpclass, **self.repeatkwargs)
                 for p in pset_new:
                     p.dt = dt
                 self.add(pset_new)
@@ -336,165 +393,37 @@ class ParticleSet(object):
                     output_file.write(self, time)
                 next_output += outputdt * np.sign(dt)
             if abs(time-next_movie) < tol:
-                self.show(field=movie_background_field, show_time=time)
+                self.show(field=movie_background_field, show_time=time, animation=True)
                 next_movie += moviedt * np.sign(dt)
             next_input = self.fieldset.computeTimeChunk(time, dt)
             if dt == 0:
                 break
+            if verbose_progress:
+                pbar.update(abs(time - _starttime))
 
         if output_file:
             output_file.write(self, time)
+        if verbose_progress:
+            pbar.finish()
 
-    def show(self, particles=True, show_time=None, field=None, domain=None,
-             land=False, vmin=None, vmax=None, savefile=None):
+    def show(self, with_particles=True, show_time=None, field=None, domain=None, projection=None,
+             land=True, vmin=None, vmax=None, savefile=None, animation=False, **kwargs):
         """Method to 'show' a Parcels ParticleSet
 
-        :param particles: Boolean whether to show particles
+        :param with_particles: Boolean whether to show particles
         :param show_time: Time at which to show the ParticleSet
         :param field: Field to plot under particles (either None, a Field object, or 'vector')
         :param domain: Four-vector (latN, latS, lonE, lonW) defining domain to show
-        :param land: Boolean whether to show land (in field='vector' mode only)
+        :param projection: type of cartopy projection to use (default PlateCarree)
+        :param land: Boolean whether to show land. This is ignored for flat meshes
         :param vmin: minimum colour scale (only in single-plot mode)
         :param vmax: maximum colour scale (only in single-plot mode)
         :param savefile: Name of a file to save the plot to
+        :param animation: Boolean whether result is a single plot, or an animation
         """
-        try:
-            import matplotlib.pyplot as plt
-        except:
-            logger.info("Visualisation is not possible. Matplotlib not found.")
-            return
-        try:
-            from mpl_toolkits.basemap import Basemap
-        except:
-            Basemap = None
-
-        plon = np.array([p.lon for p in self])
-        plat = np.array([p.lat for p in self])
-        show_time = self[0].time if show_time is None else show_time
-        if isinstance(show_time, datetime):
-            show_time = np.datetime64(show_time)
-        if isinstance(show_time, np.datetime64):
-            show_time = (show_time - self.fieldset.U.grid.time_origin) / np.timedelta64(1, 's')
-        if isinstance(show_time, delta):
-            show_time = show_time.total_seconds()
-        if np.isnan(show_time):
-            show_time = self.fieldset.U.grid.time[0]
-        if domain is not None:
-            def nearest_index(array, value):
-                """returns index of the nearest value in array using O(log n) bisection method"""
-                y = bisect.bisect(array, value)
-                if y == len(array):
-                    return y - 1
-                elif (abs(array[y - 1] - value) < abs(array[y] - value)):
-                    return y - 1
-                else:
-                    return y
-
-            latN = nearest_index(self.fieldset.U.lat, domain[0])
-            latS = nearest_index(self.fieldset.U.lat, domain[1])
-            lonE = nearest_index(self.fieldset.U.lon, domain[2])
-            lonW = nearest_index(self.fieldset.U.lon, domain[3])
-        else:
-            latN, latS, lonE, lonW = (-1, 0, -1, 0)
-        if field is not 'vector' and not land:
-            plt.ion()
-            plt.clf()
-            if particles:
-                plt.plot(np.transpose(plon), np.transpose(plat), 'ko')
-            if field is None:
-                axes = plt.gca()
-                axes.set_xlim([self.fieldset.U.lon[lonW], self.fieldset.U.lon[lonE]])
-                axes.set_ylim([self.fieldset.U.lat[latS], self.fieldset.U.lat[latN]])
-                time_origin = self.fieldset.U.grid.time_origin
-            else:
-                if not isinstance(field, Field):
-                    field = getattr(self.fieldset, field)
-                field.show(with_particles=True, show_time=show_time, vmin=vmin, vmax=vmax)
-                time_origin = field.grid.time_origin
-            xlbl = 'Zonal distance [m]' if type(self.fieldset.U.units) is UnitConverter else 'Longitude [degrees]'
-            ylbl = 'Meridional distance [m]' if type(self.fieldset.U.units) is UnitConverter else 'Latitude [degrees]'
-            plt.xlabel(xlbl)
-            plt.ylabel(ylbl)
-        elif Basemap is None:
-            logger.info("Visualisation is not possible. Basemap not found.")
-            time_origin = self.fieldset.U.grid.time_origin
-        else:
-            time_origin = self.fieldset.U.grid.time_origin
-            self.fieldset.computeTimeChunk(show_time, 1)
-            (idx, periods) = self.fieldset.U.time_index(show_time)
-            show_time -= periods*(self.fieldset.U.time[-1]-self.fieldset.U.time[0])
-            lon = self.fieldset.U.lon
-            lat = self.fieldset.U.lat
-            lon = lon[lonW:lonE]
-            lat = lat[latS:latN]
-
-            # configuring plot
-            lat_median = np.median(lat)
-            lon_median = np.median(lon)
-            plt.figure()
-            m = Basemap(projection='merc', lat_0=lat_median, lon_0=lon_median,
-                        resolution='h', area_thresh=100,
-                        llcrnrlon=lon[0], llcrnrlat=lat[0],
-                        urcrnrlon=lon[-1], urcrnrlat=lat[-1])
-            parallels = np.arange(lat[0], lat[-1], abs(lat[0]-lat[-1])/5)
-            parallels = np.around(parallels, 2)
-            m.drawparallels(parallels, labels=[1, 0, 0, 0])
-            meridians = np.arange(lon[0], lon[-1], abs(lon[0]-lon[-1])/5)
-            meridians = np.around(meridians, 2)
-            m.drawmeridians(meridians, labels=[0, 0, 0, 1])
-            if land:
-                m.drawcoastlines()
-                m.fillcontinents(color='burlywood')
-            if field is 'vector':
-                # formating velocity data for quiver plotting
-                U = np.array(self.fieldset.U.temporal_interpolate_fullfield(idx, show_time))
-                V = np.array(self.fieldset.V.temporal_interpolate_fullfield(idx, show_time))
-                U = U[latS:latN, lonW:lonE]
-                V = V[latS:latN, lonW:lonE]
-                U = np.array([U[y, x] for x in range(len(lon)) for y in range(len(lat))])
-                V = np.array([V[y, x] for x in range(len(lon)) for y in range(len(lat))])
-                speed = np.sqrt(U**2 + V**2)
-                normU = U/speed
-                normV = V/speed
-                x = np.repeat(lon, len(lat))
-                y = np.tile(lat, len(lon))
-
-                # plotting velocity vector field
-                vecs = m.quiver(x, y, normU, normV, speed, cmap=plt.cm.gist_ncar, clim=[vmin, vmax], scale=50, latlon=True)
-                m.colorbar(vecs, "right", size="5%", pad="2%")
-            elif field is not None:
-                logger.warning('Plotting of both a field and land=True is not supported in this version of Parcels')
-            # plotting particle data
-            if particles:
-                xs, ys = m(plon, plat)
-                m.scatter(xs, ys, color='black')
-
-        if time_origin is 0:
-            timestr = ' after ' + str(delta(seconds=show_time)) + ' hours'
-        else:
-            date_str = str(time_origin + np.timedelta64(int(show_time), 's'))
-            timestr = ' on ' + date_str[:10] + ' ' + date_str[11:19]
-
-        if particles:
-            if field is None:
-                plt.title('Particles' + timestr)
-            elif field is 'vector':
-                plt.title('Particles and velocity field' + timestr)
-            else:
-                plt.title('Particles and '+field.name + timestr)
-        else:
-            if field is 'vector':
-                plt.title('Velocity field' + timestr)
-            else:
-                plt.title(field.name + timestr)
-
-        if savefile is None:
-            plt.show()
-            plt.pause(0.0001)
-        else:
-            plt.savefig(savefile)
-            logger.info('Plot saved to '+savefile+'.png')
-            plt.close()
+        from parcels.plotting import plotparticles
+        plotparticles(particles=self, with_particles=with_particles, show_time=show_time, field=field, domain=domain,
+                      projection=projection, land=land, vmin=vmin, vmax=vmax, savefile=savefile, animation=animation, **kwargs)
 
     def density(self, field=None, particle_val=None, relative=False, area_scale=False):
         """Method to calculate the density of particles in a ParticleSet from their locations,

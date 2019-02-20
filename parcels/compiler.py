@@ -1,7 +1,11 @@
 import subprocess
-from os import path, environ, makedirs
+from os import path, getenv
 from tempfile import gettempdir
 from struct import calcsize
+try:
+    from pathlib import Path
+except ImportError:
+    from pathlib2 import Path  # python 2 backport
 try:
     from os import getuid
 except:
@@ -16,25 +20,24 @@ def get_package_dir():
 
 def get_cache_dir():
     directory = path.join(gettempdir(), "parcels-%s" % getuid())
-    if not path.exists(directory):
-        makedirs(directory)
+    Path(directory).mkdir(exist_ok=True)
     return directory
 
 
 class Compiler(object):
     """A compiler object for creating and loading shared libraries.
 
-    :arg cc: C compiler executable (can be overriden by exporting the
-        environment variable ``CC``).
-    :arg ld: Linker executable (optional, if ``None``, we assume the compiler
-        can build object files and link in a single invocation, can be
-        overridden by exporting the environment variable ``LDSHARED``).
+    :arg cc: C compiler executable (uses environment variable ``CC`` if not provided).
     :arg cppargs: A list of arguments to the C compiler (optional).
     :arg ldargs: A list of arguments to the linker (optional)."""
 
-    def __init__(self, cc, ld=None, cppargs=[], ldargs=[]):
-        self._cc = environ.get('CC', cc)
-        self._ld = environ.get('LDSHARED', ld)
+    def __init__(self, cc=None, cppargs=None, ldargs=None):
+        if cppargs is None:
+            cppargs = []
+        if ldargs is None:
+            ldargs = []
+
+        self._cc = getenv('CC') if cc is None else cc
         self._cppargs = cppargs
         self._ldargs = ldargs
 
@@ -65,7 +68,12 @@ class GNUCompiler(Compiler):
     :arg cppargs: A list of arguments to pass to the C compiler
          (optional).
     :arg ldargs: A list of arguments to pass to the linker (optional)."""
-    def __init__(self, cppargs=[], ldargs=[]):
+    def __init__(self, cppargs=None, ldargs=None):
+        if cppargs is None:
+            cppargs = []
+        if ldargs is None:
+            ldargs = []
+
         opt_flags = ['-g', '-O3']
         arch_flag = ['-m64' if calcsize("P") is 8 else '-m32']
         cppargs = ['-Wall', '-fPIC', '-I%s' % path.join(get_package_dir(), 'include')] + opt_flags + cppargs

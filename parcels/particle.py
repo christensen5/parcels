@@ -1,6 +1,5 @@
-from parcels.kernels.error import ErrorCode
+from parcels.tools.error import ErrorCode
 from parcels.field import Field
-from parcels.loggers import logger
 from operator import attrgetter
 import numpy as np
 from ctypes import c_void_p
@@ -22,6 +21,8 @@ class Variable(object):
     :param to_write: Boolean to control whether Variable is written to NetCDF file
     """
     def __init__(self, name, dtype=np.float32, initial=0, to_write=True):
+        if name == 'z':
+            raise NotImplementedError("Custom Variable name 'z' is not allowed, as it is used for depth in ParticleFile")
         self.name = name
         self.dtype = dtype
         self.initial = initial
@@ -124,10 +125,10 @@ class _Particle(object):
                 depth = self.getInitialValue(ptype, name='depth')
                 time = self.getInitialValue(ptype, name='time')
                 if time is None:
-                    logger.error('Cannot initialise a Variable with a Field if no time provided. '
-                                 'Add a "time=" to ParticleSet construction')
-                    exit(-1)
-                initial = v.initial[time, lon, lat, depth]
+                    raise RuntimeError('Cannot initialise a Variable with a Field if no time provided. '
+                                       'Add a "time=" to ParticleSet construction')
+                v.initial.fieldset.computeTimeChunk(time, 1)
+                initial = v.initial[time, depth, lat, lon]
             else:
                 initial = v.initial
             # Enforce type of initial value
@@ -184,8 +185,11 @@ class ScipyParticle(_Particle):
 
     def __repr__(self):
         time_string = 'not_yet_set' if self.time is None or np.isnan(self.time) else "{:f}".format(self.time)
-        return "P[%d](lon=%f, lat=%f, depth=%f, time=%s)" % (self.id, self.lon, self.lat,
-                                                             self.depth, time_string)
+        str = "P[%d](lon=%f, lat=%f, depth=%f, " % (self.id, self.lon, self.lat, self.depth)
+        for var in vars(type(self)):
+            if type(getattr(type(self), var)) is Variable and getattr(type(self), var).to_write is True:
+                str += "%s=%f, " % (var, getattr(self, var))
+        return str + "time=%s)" % time_string
 
     def delete(self):
         self.state = ErrorCode.Delete
@@ -227,8 +231,3 @@ class JITParticle(ScipyParticle):
                 setattr(self, index, -1*np.ones((fieldset.gridset.size), dtype=np.int32))
             setattr(self, index+'p', getattr(self, index).ctypes.data_as(c_void_p))
             setattr(self, 'c'+index, getattr(self, index+'p').value)
-
-    def __repr__(self):
-        time_string = 'not_yet_set' if self.time is None or np.isnan(self.time) else "{:f}".format(self.time)
-        return "P[%d](lon=%f, lat=%f, depth=%f, time=%s)" % (self.id, self.lon, self.lat,
-                                                             self.depth, time_string)

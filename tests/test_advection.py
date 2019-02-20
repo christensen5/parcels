@@ -44,6 +44,7 @@ def test_advection_zonal(lon, lat, depth, mode, npart=10):
               'V': np.zeros((lon.size, lat.size, depth.size), dtype=np.float32)}
     dimensions = {'lon': lon, 'lat': lat}
     fieldset2D = FieldSet.from_data(data2D, dimensions, mesh='spherical', transpose=True)
+    assert fieldset2D.U.creation_log == 'from_data'
 
     pset2D = ParticleSet(fieldset2D, pclass=ptype[mode],
                          lon=np.zeros(npart, dtype=np.float32) + 20.,
@@ -110,7 +111,7 @@ def periodicfields(xdim, ydim, uvel, vvel):
     return FieldSet.from_data(data, dimensions, mesh='spherical', transpose=True)
 
 
-def periodicBC(particle, fieldset, time, dt):
+def periodicBC(particle, fieldset, time):
     particle.lon = math.fmod(particle.lon, 1)
     particle.lat = math.fmod(particle.lat, 1)
 
@@ -165,7 +166,7 @@ def fieldset_stationary(xdim=100, ydim=100, maxtime=delta(hours=6)):
     Reference: N. Fabbroni, 2009, "Numerical simulations of passive
     tracers dispersion in the sea"
     """
-    time = np.arange(0., maxtime.total_seconds(), 60., dtype=np.float64)
+    time = np.arange(0., maxtime.total_seconds()+1e-5, 60., dtype=np.float64)
     dimensions = {'lon': np.linspace(0, 25000, xdim, dtype=np.float32),
                   'lat': np.linspace(0, 25000, ydim, dtype=np.float32),
                   'time': time}
@@ -202,7 +203,7 @@ def test_stationary_eddy_vertical(mode, npart=1):
     xdim = ydim = 100
     lon_data = np.linspace(0, 25000, xdim, dtype=np.float32)
     lat_data = np.linspace(0, 25000, ydim, dtype=np.float32)
-    time_data = np.arange(0., 6*3600, 60., dtype=np.float64)
+    time_data = np.arange(0., 6*3600+1e-5, 60., dtype=np.float64)
     fld1 = np.ones((xdim, ydim, 1), dtype=np.float32) * u_0 * np.cos(f * time_data)
     fld2 = np.ones((xdim, ydim, 1), dtype=np.float32) * -u_0 * np.sin(f * time_data)
     fldzero = np.zeros((xdim, ydim, 1), dtype=np.float32) * time_data
@@ -246,7 +247,7 @@ def fieldset_moving(xdim=100, ydim=100, maxtime=delta(hours=6)):
     Reference: N. Fabbroni, 2009, "Numerical simulations of passive
     tracers dispersion in the sea"
     """
-    time = np.arange(0., maxtime.total_seconds(), 60., dtype=np.float64)
+    time = np.arange(0., maxtime.total_seconds()+1e-5, 60., dtype=np.float64)
     dimensions = {'lon': np.linspace(0, 25000, xdim, dtype=np.float32),
                   'lat': np.linspace(0, 25000, ydim, dtype=np.float32),
                   'time': time}
@@ -274,12 +275,12 @@ def test_moving_eddy(fieldset_moving, mode, method, rtol, npart=1):
 
 
 def truth_decaying(x_0, y_0, t):
-    lat = y_0 - ((u_0 - u_g) * f / (f ** 2 + gamma ** 2) *
-                 (1 - np.exp(-gamma * t) * (np.cos(f * t) + gamma / f * np.sin(f * t))))
-    lon = x_0 + (u_g / gamma_g * (1 - np.exp(-gamma_g * t)) +
-                 (u_0 - u_g) * f / (f ** 2 + gamma ** 2) *
-                 (gamma / f + np.exp(-gamma * t) *
-                  (math.sin(f * t) - gamma / f * math.cos(f * t))))
+    lat = y_0 - ((u_0 - u_g) * f / (f ** 2 + gamma ** 2)
+                 * (1 - np.exp(-gamma * t) * (np.cos(f * t) + gamma / f * np.sin(f * t))))
+    lon = x_0 + (u_g / gamma_g * (1 - np.exp(-gamma_g * t))
+                 + (u_0 - u_g) * f / (f ** 2 + gamma ** 2)
+                 * (gamma / f + np.exp(-gamma * t)
+                    * (math.sin(f * t) - gamma / f * math.cos(f * t))))
     return lon, lat
 
 
@@ -290,7 +291,7 @@ def fieldset_decaying(xdim=100, ydim=100, maxtime=delta(hours=6)):
     Reference: N. Fabbroni, 2009, "Numerical simulations of passive
     tracers dispersion in the sea"
     """
-    time = np.arange(0., maxtime.total_seconds(), 60., dtype=np.float64)
+    time = np.arange(0., maxtime.total_seconds()+1e-5, 60., dtype=np.float64)
     dimensions = {'lon': np.linspace(0, 25000, xdim, dtype=np.float32),
                   'lat': np.linspace(0, 25000, ydim, dtype=np.float32),
                   'time': time}

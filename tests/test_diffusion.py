@@ -73,8 +73,8 @@ def test_fieldKh_SpatiallyVaryingBrownianMotion(mesh, mode, xdim=200, ydim=100):
 
     dKh_zonal_dx, _ = fieldset.Kh_zonal.gradient()
     _, dKh_meridional_dy = fieldset.Kh_meridional.gradient()
-    fieldset.add_field(Field('dKh_zonal_dx', dKh_zonal_dx, grid=grid))
-    fieldset.add_field(Field('dKh_meridional_dy', dKh_meridional_dy, grid=grid))
+    fieldset.add_field(dKh_zonal_dx)
+    fieldset.add_field(dKh_meridional_dy)
     if mesh is 'spherical':
         fieldset.dKh_zonal_dx.units = GeographicPolar()
         fieldset.dKh_meridional_dy.units = Geographic()
@@ -109,7 +109,7 @@ def test_randomexponential(mode, lambd, npart=1000):
 
     pset = ParticleSet(fieldset=fieldset, pclass=ptype[mode], lon=np.zeros(npart), lat=np.zeros(npart), depth=np.zeros(npart))
 
-    def vertical_randomexponential(particle, fieldset, time, dt):
+    def vertical_randomexponential(particle, fieldset, time):
         # Kernel for random exponential variable in depth direction
         particle.depth = random.expovariate(fieldset.lambd)
 

@@ -27,7 +27,7 @@ def test_variable_init(fieldset, mode, npart=10):
                        lon=np.linspace(0, 1, npart, dtype=np.float32),
                        lat=np.linspace(1, 0, npart, dtype=np.float32))
 
-    def addOne(particle, fieldset, time, dt):
+    def addOne(particle, fieldset, time):
         particle.p_float += 1.
         particle.p_double += 1.
         particle.p_int += 1
@@ -49,6 +49,19 @@ def test_variable_unsupported_dtypes(fieldset, mode, type):
     except RuntimeError:
         error_thrown = True
     assert error_thrown
+
+
+@pytest.mark.parametrize('mode', ['scipy', 'jit'])
+def test_variable_special_names(fieldset, mode):
+    """Test that checks errors thrown for special names"""
+    class TestParticle(ptype[mode]):
+        error_thrown = False
+        try:
+            z = Variable('z', dtype=np.float32, initial=10.)
+        except RuntimeError:
+            error_thrown = True
+        assert error_thrown
+    ParticleSet(fieldset, pclass=TestParticle, lon=[0], lat=[0])
 
 
 @pytest.mark.parametrize('mode', ['scipy', 'jit'])

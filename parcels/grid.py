@@ -1,9 +1,10 @@
-from parcels.loggers import logger
+from parcels.tools.loggers import logger
+from parcels.tools.converters import TimeConverter
 import numpy as np
 from ctypes import Structure, c_int, c_float, c_double, POINTER, cast, c_void_p, pointer
 from enum import IntEnum
 
-__all__ = ['GridCode', 'RectilinearZGrid', 'RectilinearSGrid', 'CurvilinearZGrid', 'CurvilinearSGrid', 'CGrid']
+__all__ = ['GridCode', 'RectilinearZGrid', 'RectilinearSGrid', 'CurvilinearZGrid', 'CurvilinearSGrid', 'CGrid', 'Grid']
 
 
 class GridCode(IntEnum):
@@ -27,6 +28,7 @@ class Grid(object):
         self.lon = lon
         self.lat = lat
         self.time = np.zeros(1, dtype=np.float64) if time is None else time
+        self.time_full = self.time  # needed for deferred_loaded Fields
         if not self.lon.dtype == np.float32:
             logger.warning_once("Casting lon data to np.float32")
             self.lon = self.lon.astype(np.float32)
@@ -34,9 +36,11 @@ class Grid(object):
             logger.warning_once("Casting lat data to np.float32")
             self.lat = self.lat.astype(np.float32)
         if not self.time.dtype == np.float64:
+            assert isinstance(self.time[0], (np.integer, np.floating, float, int)), 'Time vector must be an array of int or floats'
             logger.warning_once("Casting time data to np.float64")
             self.time = self.time.astype(np.float64)
-        self.time_origin = time_origin
+        self.time_origin = TimeConverter() if time_origin is None else time_origin
+        assert isinstance(self.time_origin, TimeConverter), 'time_origin needs to be a TimeConverter object'
         self.mesh = mesh
         self.cstruct = None
         self.cell_edge_sizes = {}
@@ -45,6 +49,21 @@ class Grid(object):
         self.meridional_halo = 0
         self.lat_flipped = False
         self.defer_load = False
+        self.lonlat_minmax = np.array([np.nanmin(lon), np.nanmax(lon), np.nanmin(lat), np.nanmax(lat)], dtype=np.float32)
+        self.periods = 0
+
+    @staticmethod
+    def create_grid(lon, lat, depth, time, time_origin, mesh, **kwargs):
+        if len(lon.shape) == 1:
+            if depth is None or len(depth.shape) == 1:
+                return RectilinearZGrid(lon, lat, depth, time, time_origin=time_origin, mesh=mesh, **kwargs)
+            else:
+                return RectilinearSGrid(lon, lat, depth, time, time_origin=time_origin, mesh=mesh, **kwargs)
+        else:
+            if depth is None or len(depth.shape) == 1:
+                return CurvilinearZGrid(lon, lat, depth, time, time_origin=time_origin, mesh=mesh, **kwargs)
+            else:
+                return CurvilinearSGrid(lon, lat, depth, time, time_origin=time_origin, mesh=mesh, **kwargs)
 
     @property
     def ctypes_struct(self):
@@ -63,15 +82,22 @@ class Grid(object):
             _fields_ = [('xdim', c_int), ('ydim', c_int), ('zdim', c_int),
                         ('tdim', c_int), ('z4d', c_int),
                         ('mesh_spherical', c_int), ('zonal_periodic', c_int),
+                        ('tfull_min', c_double), ('tfull_max', c_double), ('periods', POINTER(c_int)),
+                        ('lonlat_minmax', POINTER(c_float)),
                         ('lon', POINTER(c_float)), ('lat', POINTER(c_float)),
                         ('depth', POINTER(c_float)), ('time', POINTER(c_double))
                         ]
 
         # Create and populate the c-struct object
         if not self.cstruct:  # Not to point to the same grid various times if grid in various fields
+            if not isinstance(self.periods, c_int):
+                self.periods = c_int()
+                self.periods.value = 0
             self.cstruct = CStructuredGrid(self.xdim, self.ydim, self.zdim,
                                            self.tdim, self.z4d,
                                            self.mesh == 'spherical', self.zonal_periodic,
+                                           self.time_full[0], self.time_full[-1], pointer(self.periods),
+                                           self.lonlat_minmax.ctypes.data_as(POINTER(c_float)),
                                            self.lon.ctypes.data_as(POINTER(c_float)),
                                            self.lat.ctypes.data_as(POINTER(c_float)),
                                            self.depth.ctypes.data_as(POINTER(c_float)),
@@ -92,7 +118,9 @@ class Grid(object):
         return lon
 
     def advancetime(self, grid_new):
-        grid_new.time = grid_new.time + (grid_new.time_origin - self.time_origin) / np.timedelta64(1, 's')
+        assert isinstance(grid_new.time_origin, type(self.time_origin)), 'time_origin of new and old grids must be either both None or both a date'
+        if self.time_origin:
+            grid_new.time = grid_new.time + self.time_origin.reltime(grid_new.time_origin)
         if len(grid_new.time) is not 1:
             raise RuntimeError('New FieldSet needs to have only one snapshot')
         if grid_new.time > self.time[-1]:  # forward in time, so appending at end
@@ -114,31 +142,36 @@ class Grid(object):
 
     def computeTimeChunk(self, f, time, signdt):
         nextTime_loc = np.infty * signdt
+        periods = self.periods.value if isinstance(self.periods, c_int) else self.periods
         if self.update_status == 'not_updated':
             if self.ti >= 0:
-                if signdt >= 0 and ((time < self.time[0] and self.ti > 0)
-                   or (time > self.time[2] and self.ti < len(self.time_full)-3)):
+                if (time - periods*(self.time_full[-1]-self.time_full[0]) < self.time[0] or time - periods*(self.time_full[-1]-self.time_full[0]) > self.time[2]):
                     self.ti = -1  # reset
-                elif signdt >= 0 and time >= self.time[1] and self.ti < len(self.time_full)-3:
+                elif (time - periods*(self.time_full[-1]-self.time_full[0]) < self.time_full[0] or time - periods*(self.time_full[-1]-self.time_full[0]) >= self.time_full[-1]):
+                    self.ti = -1  # reset
+                elif signdt >= 0 and time - periods*(self.time_full[-1]-self.time_full[0]) >= self.time[1] and self.ti < len(self.time_full)-3:
                     self.ti += 1
                     self.time = self.time_full[self.ti:self.ti+3]
                     self.update_status = 'updated'
-                elif signdt == -1 and time <= self.time[1] and self.ti > 0:
+                elif signdt == -1 and time - periods*(self.time_full[-1]-self.time_full[0]) <= self.time[1] and self.ti > 0:
                     self.ti -= 1
                     self.time = self.time_full[self.ti:self.ti+3]
                     self.update_status = 'updated'
             if self.ti == -1:
                 self.time = self.time_full
                 self.ti, _ = f.time_index(time)
+                periods = self.periods.value if isinstance(self.periods, c_int) else self.periods
                 if self.ti > 0 and signdt == -1:
-                    self.ti = self.ti-2 if len(self.time_full)-1 else self.ti-1
+                    self.ti -= 1
+                if self.ti >= len(self.time_full) - 2:
+                    self.ti = len(self.time_full) - 3
                 self.time = self.time_full[self.ti:self.ti+3]
                 self.tdim = 3
                 self.update_status = 'first_updated'
-            if signdt >= 0 and self.ti < len(self.time_full)-3:
-                nextTime_loc = self.time[2]
-            elif signdt == -1 and self.ti > 0:
-                nextTime_loc = self.time[0]
+            if signdt >= 0 and (self.ti < len(self.time_full)-3 or not f.allow_time_extrapolation):
+                nextTime_loc = self.time[2] + periods*(self.time_full[-1]-self.time_full[0])
+            elif signdt == -1 and (self.ti > 0 or not f.allow_time_extrapolation):
+                nextTime_loc = self.time[0] + periods*(self.time_full[-1]-self.time_full[0])
         return nextTime_loc
 
 
@@ -155,7 +188,7 @@ class RectilinearGrid(Grid):
         if isinstance(time, np.ndarray):
             assert(len(time.shape) == 1), 'time is not a vector'
 
-        Grid.__init__(self, lon, lat, time, time_origin, mesh)
+        super(RectilinearGrid, self).__init__(lon, lat, time, time_origin, mesh)
         self.xdim = self.lon.size
         self.ydim = self.lat.size
         self.tdim = self.time.size
@@ -189,6 +222,7 @@ class RectilinearGrid(Grid):
                                       self.lat, self.lat[0:halosize] + latshift))
             self.ydim = self.lat.size
             self.meridional_halo = halosize
+        self.lonlat_minmax = np.array([np.nanmin(self.lon), np.nanmax(self.lon), np.nanmin(self.lat), np.nanmax(self.lat)], dtype=np.float32)
 
 
 class RectilinearZGrid(RectilinearGrid):
@@ -199,7 +233,7 @@ class RectilinearZGrid(RectilinearGrid):
     :param depth: Vector containing the vertical coordinates of the grid, which are z-coordinates.
            The depth of the different layers is thus constant.
     :param time: Vector containing the time coordinates of the grid
-    :param time_origin: Time origin of the time axis
+    :param time_origin: Time origin (TimeConverter object) of the time axis
     :param mesh: String indicating the type of mesh coordinates and
            units used during velocity interpolation:
 
@@ -208,8 +242,8 @@ class RectilinearZGrid(RectilinearGrid):
            2. flat: No conversion, lat/lon are assumed to be in m.
     """
 
-    def __init__(self, lon, lat, depth=None, time=None, time_origin=0, mesh='flat'):
-        RectilinearGrid.__init__(self, lon, lat, time, time_origin, mesh)
+    def __init__(self, lon, lat, depth=None, time=None, time_origin=None, mesh='flat'):
+        super(RectilinearZGrid, self).__init__(lon, lat, time, time_origin, mesh)
         if isinstance(depth, np.ndarray):
             assert(len(depth.shape) == 1), 'depth is not a vector'
 
@@ -236,7 +270,7 @@ class RectilinearSGrid(RectilinearGrid):
            the number of the layer and the time is depth is a 4D array.
            depth array is either a 4D array[xdim][ydim][zdim][tdim] or a 3D array[xdim][ydim[zdim].
     :param time: Vector containing the time coordinates of the grid
-    :param time_origin: Time origin of the time axis
+    :param time_origin: Time origin (TimeConverter object) of the time axis
     :param mesh: String indicating the type of mesh coordinates and
            units used during velocity interpolation:
 
@@ -245,8 +279,8 @@ class RectilinearSGrid(RectilinearGrid):
            2. flat: No conversion, lat/lon are assumed to be in m.
     """
 
-    def __init__(self, lon, lat, depth, time=None, time_origin=0, mesh='flat'):
-        RectilinearGrid.__init__(self, lon, lat, time, time_origin, mesh)
+    def __init__(self, lon, lat, depth, time=None, time_origin=None, mesh='flat'):
+        super(RectilinearSGrid, self).__init__(lon, lat, time, time_origin, mesh)
         assert(isinstance(depth, np.ndarray) and len(depth.shape) in [3, 4]), 'depth is not a 3D or 4D numpy array'
 
         self.gtype = GridCode.RectilinearSGrid
@@ -269,7 +303,7 @@ class RectilinearSGrid(RectilinearGrid):
 
 class CurvilinearGrid(Grid):
 
-    def __init__(self, lon, lat, time=None, time_origin=0, mesh='flat'):
+    def __init__(self, lon, lat, time=None, time_origin=None, mesh='flat'):
         assert(isinstance(lon, np.ndarray) and len(lon.squeeze().shape) == 2), 'lon is not a 2D numpy array'
         assert(isinstance(lat, np.ndarray) and len(lat.squeeze().shape) == 2), 'lat is not a 2D numpy array'
         assert (isinstance(time, np.ndarray) or not time), 'time is not a numpy array'
@@ -278,7 +312,7 @@ class CurvilinearGrid(Grid):
 
         lon = lon.squeeze()
         lat = lat.squeeze()
-        Grid.__init__(self, lon, lat, time, time_origin, mesh)
+        super(CurvilinearGrid, self).__init__(lon, lat, time, time_origin, mesh)
         self.xdim = self.lon.shape[1]
         self.ydim = self.lon.shape[0]
         self.tdim = self.time.size
@@ -328,7 +362,7 @@ class CurvilinearZGrid(CurvilinearGrid):
     :param depth: Vector containing the vertical coordinates of the grid, which are z-coordinates.
            The depth of the different layers is thus constant.
     :param time: Vector containing the time coordinates of the grid
-    :param time_origin: Time origin of the time axis
+    :param time_origin: Time origin (TimeConverter object) of the time axis
     :param mesh: String indicating the type of mesh coordinates and
            units used during velocity interpolation:
 
@@ -337,8 +371,8 @@ class CurvilinearZGrid(CurvilinearGrid):
            2. flat: No conversion, lat/lon are assumed to be in m.
     """
 
-    def __init__(self, lon, lat, depth=None, time=None, time_origin=0, mesh='flat'):
-        CurvilinearGrid.__init__(self, lon, lat, time, time_origin, mesh)
+    def __init__(self, lon, lat, depth=None, time=None, time_origin=None, mesh='flat'):
+        super(CurvilinearZGrid, self).__init__(lon, lat, time, time_origin, mesh)
         if isinstance(depth, np.ndarray):
             assert(len(depth.shape) == 1), 'depth is not a vector'
 
@@ -364,7 +398,7 @@ class CurvilinearSGrid(CurvilinearGrid):
            the number of the layer and the time is depth is a 4D array.
            depth array is either a 4D array[xdim][ydim][zdim][tdim] or a 3D array[xdim][ydim[zdim].
     :param time: Vector containing the time coordinates of the grid
-    :param time_origin: Time origin of the time axis
+    :param time_origin: Time origin (TimeConverter object) of the time axis
     :param mesh: String indicating the type of mesh coordinates and
            units used during velocity interpolation:
 
@@ -373,8 +407,8 @@ class CurvilinearSGrid(CurvilinearGrid):
            2. flat: No conversion, lat/lon are assumed to be in m.
     """
 
-    def __init__(self, lon, lat, depth, time=None, time_origin=0, mesh='flat'):
-        CurvilinearGrid.__init__(self, lon, lat, time, time_origin, mesh)
+    def __init__(self, lon, lat, depth, time=None, time_origin=None, mesh='flat'):
+        super(CurvilinearSGrid, self).__init__(lon, lat, time, time_origin, mesh)
         assert(isinstance(depth, np.ndarray) and len(depth.shape) in [3, 4]), 'depth is not a 4D numpy array'
 
         self.gtype = GridCode.CurvilinearSGrid

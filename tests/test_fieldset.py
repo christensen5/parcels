@@ -1,7 +1,10 @@
-from parcels import FieldSet, ParticleSet, ScipyParticle, JITParticle, Variable, AdvectionRK4_3D
-from parcels.field import Field
+from parcels import FieldSet, ParticleSet, ScipyParticle, JITParticle, Variable, AdvectionRK4, AdvectionRK4_3D, RectilinearZGrid, ErrorCode
+from parcels.field import Field, VectorField
+from parcels.tools.converters import TimeConverter
 from datetime import timedelta as delta
+import datetime
 import numpy as np
+import xarray as xr
 import math
 import pytest
 from os import path
@@ -15,9 +18,15 @@ def generate_fieldset(xdim, ydim, zdim=1, tdim=1):
     lat = np.linspace(0., 10., ydim, dtype=np.float32)
     depth = np.zeros(zdim, dtype=np.float32)
     time = np.zeros(tdim, dtype=np.float64)
-    U, V = np.meshgrid(lon, lat)
+    if zdim == 1 and tdim == 1:
+        U, V = np.meshgrid(lon, lat)
+        dimensions = {'lat': lat, 'lon': lon}
+    else:
+        U = np.ones((tdim, zdim, ydim, xdim))
+        V = np.ones((tdim, zdim, ydim, xdim))
+        dimensions = {'lat': lat, 'lon': lon, 'depth': depth, 'time': time}
     data = {'U': np.array(U, dtype=np.float32), 'V': np.array(V, dtype=np.float32)}
-    dimensions = {'lat': lat, 'lon': lon, 'depth': depth, 'time': time}
+
     return (data, dimensions)
 
 
@@ -76,6 +85,25 @@ def test_fieldset_from_parcels(xdim, ydim, tmpdir, filename='test_parcels'):
     assert np.allclose(fieldset.V.data[0, :], data['V'], rtol=1e-12)
 
 
+@pytest.mark.parametrize('calendar', ['noleap', '360day'])
+def test_fieldset_nonstandardtime(calendar, tmpdir, filename='test_nonstandardtime.nc', xdim=4, ydim=6):
+    from cftime import DatetimeNoLeap, Datetime360Day
+    filepath = tmpdir.join(filename)
+
+    if calendar == 'noleap':
+        dates = [DatetimeNoLeap(0, m, 1) for m in range(1, 13)]
+    else:
+        dates = [Datetime360Day(0, m, 1) for m in range(1, 13)]
+    da = xr.DataArray(np.random.rand(12, xdim, ydim),
+                      coords=[dates, range(xdim), range(ydim)],
+                      dims=['time', 'lon', 'lat'], name='U')
+    da.to_netcdf(str(filepath))
+
+    dims = {'lon': 'lon', 'lat': 'lat', 'time': 'time'}
+    field = Field.from_netcdf(filepath, 'U', dims)
+    assert field.grid.time_origin.calendar == 'cftime'
+
+
 @pytest.mark.parametrize('indslon', [range(10, 20), [1]])
 @pytest.mark.parametrize('indslat', [range(30, 60), [22]])
 def test_fieldset_from_file_subsets(indslon, indslat, tmpdir, filename='test_subsets'):
@@ -85,7 +113,9 @@ def test_fieldset_from_file_subsets(indslon, indslat, tmpdir, filename='test_sub
     fieldsetfull = FieldSet.from_data(data, dimensions)
     fieldsetfull.write(filepath)
     indices = {'lon': indslon, 'lat': indslat}
+    indices_back = indices.copy()
     fieldsetsub = FieldSet.from_parcels(filepath, indices=indices)
+    assert indices == indices_back
     assert np.allclose(fieldsetsub.U.lon, fieldsetfull.U.grid.lon[indices['lon']])
     assert np.allclose(fieldsetsub.U.lat, fieldsetfull.U.grid.lat[indices['lat']])
     assert np.allclose(fieldsetsub.V.lon, fieldsetfull.V.grid.lon[indices['lon']])
@@ -141,6 +171,24 @@ def test_fieldset_celledgesizes_curvilinear(dx, dy):
     assert np.allclose(A, fieldset.dx.data * fieldset.dy.data)
 
 
+def test_fieldset_write_curvilinear(tmpdir):
+    fname = path.join(path.dirname(__file__), 'test_data', 'mask_nemo_cross_180lon.nc')
+    filenames = {'dx': fname, 'mesh_mask': fname}
+    variables = {'dx': 'e1u'}
+    dimensions = {'lon': 'glamu', 'lat': 'gphiu'}
+    fieldset = FieldSet.from_nemo(filenames, variables, dimensions)
+    assert fieldset.dx.creation_log == 'from_nemo'
+
+    newfile = tmpdir.join('curv_field')
+    fieldset.write(newfile)
+
+    fieldset2 = FieldSet.from_netcdf(filenames=newfile+'dx.nc', variables={'dx': 'dx'}, dimensions={'lon': 'nav_lon', 'lat': 'nav_lat'})
+    assert fieldset2.dx.creation_log == 'from_netcdf'
+
+    for var in ['lon', 'lat', 'data']:
+        assert np.allclose(getattr(fieldset2.dx, var), getattr(fieldset.dx, var))
+
+
 @pytest.mark.parametrize('mesh', ['flat', 'spherical'])
 def test_fieldset_cellareas(mesh):
     data, dimensions = generate_fieldset(10, 7)
@@ -170,11 +218,11 @@ def test_fieldset_gradient(mesh):
         for y in range(np_dFdx.shape[0]):
             np_dFdx[:, y] /= math.cos(fieldset.V.grid.lat[y] * math.pi / 180.)
 
-    assert np.allclose(dFdx, np_dFdx, rtol=5e-2)  # Field gradient dx.
-    assert np.allclose(dFdy, np_dFdy, rtol=5e-2)  # Field gradient dy.
+    assert np.allclose(dFdx.data, np_dFdx, rtol=5e-2)  # Field gradient dx.
+    assert np.allclose(dFdy.data, np_dFdy, rtol=5e-2)  # Field gradient dy.
 
 
-def addConst(particle, fieldset, time, dt):
+def addConst(particle, fieldset, time):
     particle.lon = particle.lon + fieldset.movewest + fieldset.moveeast
 
 
@@ -192,6 +240,32 @@ def test_fieldset_constant(mode):
                                  start=(0.5, 0.5), finish=(0.5, 0.5))
     pset.execute(pset.Kernel(addConst), dt=1, runtime=1)
     assert abs(pset[0].lon - (0.5 + westval + eastval)) < 1e-4
+
+
+@pytest.mark.parametrize('mode', ['scipy', 'jit'])
+@pytest.mark.parametrize('swapUV', [False, True])
+def test_vector_fields(mode, swapUV):
+    lon = np.linspace(0., 10., 12, dtype=np.float32)
+    lat = np.linspace(0., 10., 10, dtype=np.float32)
+    U = np.ones((10, 12), dtype=np.float32)
+    V = np.zeros((10, 12), dtype=np.float32)
+    data = {'U': U, 'V': V}
+    dimensions = {'U': {'lat': lat, 'lon': lon},
+                  'V': {'lat': lat, 'lon': lon}}
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
+    if swapUV:  # we test that we can freely edit whatever UV field
+        UV = VectorField('UV', fieldset.V, fieldset.U)
+        fieldset.add_vector_field(UV)
+
+    pset = ParticleSet.from_line(fieldset, size=1, pclass=ptype[mode],
+                                 start=(0.5, 0.5), finish=(0.5, 0.5))
+    pset.execute(AdvectionRK4, dt=1, runtime=1)
+    if swapUV:
+        assert abs(pset[0].lon - .5) < 1e-9
+        assert abs(pset[0].lat - 1.5) < 1e-9
+    else:
+        assert abs(pset[0].lon - 1.5) < 1e-9
+        assert abs(pset[0].lat - .5) < 1e-9
 
 
 @pytest.mark.parametrize('mode', ['scipy', 'jit'])
@@ -217,13 +291,13 @@ def test_periodic(mode, time_periodic, dt_sign):
 
     data = {'U': U, 'V': V, 'W': W, 'temp': temp}
     dimensions = {'lon': lon, 'lat': lat, 'depth': depth, 'time': time}
-    fieldset = FieldSet.from_data(data, dimensions, mesh='flat', time_periodic=time_periodic, transpose=True)
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat', time_periodic=time_periodic, transpose=True, allow_time_extrapolation=True)
 
-    def sampleTemp(particle, fieldset, time, dt):
+    def sampleTemp(particle, fieldset, time):
         # Note that fieldset.temp is interpolated at time=time+dt.
         # Indeed, sampleTemp is called at time=time, but the result is written
         # at time=time+dt, after the Kernel update
-        particle.temp = fieldset.temp[time+dt, particle.lon, particle.lat, particle.depth]
+        particle.temp = fieldset.temp[time+particle.dt, particle.depth, particle.lat, particle.lon]
 
     class MyParticle(ptype[mode]):
         temp = Variable('temp', dtype=np.float32, initial=20.)
@@ -242,3 +316,156 @@ def test_periodic(mode, time_periodic, dt_sign):
     elif dt_sign == -1:
         temp_theo = temp_vec[0]
     assert np.allclose(temp_theo, pset.particles[0].temp, atol=1e-5)
+
+
+@pytest.mark.parametrize('fail', [False, pytest.param(True, marks=pytest.mark.xfail(strict=True))])
+def test_fieldset_defer_loading_with_diff_time_origin(tmpdir, fail, filename='test_parcels_defer_loading'):
+    filepath = tmpdir.join(filename)
+    data0, dims0 = generate_fieldset(10, 10, 1, 10)
+    dims0['time'] = np.arange(0, 10, 1) * 3600
+    fieldset_out = FieldSet.from_data(data0, dims0)
+    fieldset_out.U.grid.time_origin = TimeConverter(np.datetime64('2018-04-20'))
+    fieldset_out.V.grid.time_origin = TimeConverter(np.datetime64('2018-04-20'))
+    data1, dims1 = generate_fieldset(10, 10, 1, 10)
+    if fail:
+        dims1['time'] = np.arange(0, 10, 1) * 3600
+    else:
+        dims1['time'] = np.arange(0, 10, 1) * 1800 + (24+25)*3600
+    if fail:
+        Wtime_origin = TimeConverter(np.datetime64('2018-04-22'))
+    else:
+        Wtime_origin = TimeConverter(np.datetime64('2018-04-18'))
+    gridW = RectilinearZGrid(dims1['lon'], dims1['lat'], dims1['depth'], dims1['time'], time_origin=Wtime_origin)
+    fieldW = Field('W', np.zeros(data1['U'].shape), grid=gridW)
+    fieldset_out.add_field(fieldW)
+    fieldset_out.write(filepath)
+    fieldset = FieldSet.from_parcels(filepath, extra_fields={'W': 'W'})
+    assert fieldset.U.creation_log == 'from_parcels'
+    pset = ParticleSet.from_list(fieldset, pclass=JITParticle, lon=[0.5], lat=[0.5], depth=[0.5],
+                                 time=[datetime.datetime(2018, 4, 20, 1)])
+    pset.execute(AdvectionRK4_3D, runtime=delta(hours=4), dt=delta(hours=1))
+
+
+@pytest.mark.parametrize('zdim', [2, 8])
+@pytest.mark.parametrize('scale_fac', [0.2, 4, 1])
+def test_fieldset_defer_loading_function(zdim, scale_fac, tmpdir, filename='test_parcels_defer_loading'):
+    filepath = tmpdir.join(filename)
+    data0, dims0 = generate_fieldset(3, 3, zdim, 10)
+    data0['U'][:, 0, :, :] = np.nan  # setting first layer to nan, which will be changed to zero (and all other layers to 1)
+    dims0['time'] = np.arange(0, 10, 1) * 3600
+    dims0['depth'] = np.arange(0, zdim, 1)
+    fieldset_out = FieldSet.from_data(data0, dims0)
+    fieldset_out.write(filepath)
+    fieldset = FieldSet.from_parcels(filepath)
+
+    # testing for combination of deferred-loaded and numpy Fields
+    fieldset.add_field(Field('numpyfield', np.zeros((10, zdim, 3, 3)), grid=fieldset.U.grid))
+
+    # testing for scaling factors
+    fieldset.U.set_scaling_factor(scale_fac)
+
+    dFdx, dFdy = fieldset.V.gradient()
+
+    dz = np.gradient(fieldset.U.depth)
+    DZ = np.moveaxis(np.tile(dz, (fieldset.U.grid.ydim, fieldset.U.grid.xdim, 1)), [0, 1, 2], [1, 2, 0])
+
+    def compute(fieldset):
+        # Calculating vertical weighted average
+        for f in [fieldset.U, fieldset.V]:
+            for tind in f.loaded_time_indices:
+                f.data[tind, :] = np.sum(f.data[tind, :] * DZ, axis=0) / sum(dz)
+
+    fieldset.compute_on_defer = compute
+    fieldset.computeTimeChunk(1, 1)
+    assert np.allclose(fieldset.U.data, scale_fac*(zdim-1.)/zdim)
+    assert np.allclose(dFdx.data, 0)
+
+    pset = ParticleSet(fieldset, JITParticle, 0, 0)
+
+    def DoNothing(particle, fieldset, time):
+        return ErrorCode.Success
+
+    pset.execute(DoNothing, dt=3600)
+    assert np.allclose(fieldset.U.data, scale_fac*(zdim-1.)/zdim)
+    assert np.allclose(dFdx.data, 0)
+
+
+@pytest.mark.parametrize('maxlatind', [3, pytest.param(2, marks=pytest.mark.xfail(strict=True))])
+def test_fieldset_from_xarray(maxlatind):
+    def generate_dataset(xdim, ydim, zdim=1, tdim=1):
+        lon = np.linspace(0., 12, xdim, dtype=np.float32)
+        lat = np.linspace(0., 12, ydim, dtype=np.float32)
+        depth = np.linspace(0., 20., zdim, dtype=np.float32)
+        time = np.linspace(0., 10, tdim, dtype=np.float64)
+        Uxr = np.ones((tdim, zdim, ydim, xdim), dtype=np.float32)
+        Vxr = np.ones((tdim, zdim, ydim, xdim), dtype=np.float32)
+        for t in range(Uxr.shape[0]):
+            Uxr[t, :, :, :] = t/10.
+        coords = {'lat': lat, 'lon': lon, 'depth': depth, 'time': time}
+        dims = ('time', 'depth', 'lat', 'lon')
+        return xr.Dataset({'Uxr': xr.DataArray(Uxr, coords=coords, dims=dims),
+                           'Vxr': xr.DataArray(Vxr, coords=coords, dims=dims)})
+
+    ds = generate_dataset(3, 3, 2, 10)
+    variables = {'U': 'Uxr', 'V': 'Vxr'}
+    dimensions = {'lat': 'lat', 'lon': 'lon', 'depth': 'depth', 'time': 'time'}
+    indices = {'lat': range(0, maxlatind)}
+    fieldset = FieldSet.from_xarray_dataset(ds, variables, dimensions, indices, mesh='flat')
+    assert fieldset.U.creation_log == 'from_xarray_dataset'
+
+    pset = ParticleSet(fieldset, JITParticle, 0, 0)
+
+    pset.execute(AdvectionRK4, dt=1)
+    assert pset[0].lon == 4.5 and pset[0].lat == 10
+
+
+def test_fieldset_from_data_gridtypes(xdim=20, ydim=10, zdim=4):
+    """ Simple test for fieldset initialisation from data. """
+    lon = np.linspace(0., 10., xdim, dtype=np.float32)
+    lat = np.linspace(0., 10., ydim, dtype=np.float32)
+    depth = np.linspace(0., 1., zdim, dtype=np.float32)
+    depth_s = np.ones((zdim, ydim, xdim))
+    U = np.ones((zdim, ydim, xdim))
+    V = np.ones((zdim, ydim, xdim))
+    dimensions = {'lat': lat, 'lon': lon, 'depth': depth}
+    data = {'U': np.array(U, dtype=np.float32), 'V': np.array(V, dtype=np.float32)}
+    lonm, latm = np.meshgrid(lon, lat)
+    for k in range(zdim):
+        data['U'][k, :, :] = lonm * (depth[k]+1) + .1
+        depth_s[k, :, :] = depth[k]
+
+    # Rectilinear Z grid
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
+    pset = ParticleSet(fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset.execute(AdvectionRK4, runtime=1, dt=.5)
+    plon = [p.lon for p in pset]
+    plat = [p.lat for p in pset]
+    # sol of  dx/dt = (init_depth+1)*x+0.1; x(0)=0
+    assert np.allclose(plon, [0.17173462592827032, 0.2177736932123214])
+    assert np.allclose(plat, [1, 1])
+
+    # Rectilinear S grid
+    dimensions['depth'] = depth_s
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
+    pset = ParticleSet(fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset.execute(AdvectionRK4, runtime=1, dt=.5)
+    assert np.allclose(plon, [p.lon for p in pset])
+    assert np.allclose(plat, [p.lat for p in pset])
+
+    # Curvilinear Z grid
+    dimensions['lon'] = lonm
+    dimensions['lat'] = latm
+    dimensions['depth'] = depth
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
+    pset = ParticleSet(fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset.execute(AdvectionRK4, runtime=1, dt=.5)
+    assert np.allclose(plon, [p.lon for p in pset])
+    assert np.allclose(plat, [p.lat for p in pset])
+
+    # Curvilinear S grid
+    dimensions['depth'] = depth_s
+    fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
+    pset = ParticleSet(fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset.execute(AdvectionRK4, runtime=1, dt=.5)
+    assert np.allclose(plon, [p.lon for p in pset])
+    assert np.allclose(plat, [p.lat for p in pset])

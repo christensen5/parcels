@@ -1,8 +1,8 @@
 from parcels.codegenerator import KernelGenerator, LoopGenerator
 from parcels.compiler import get_cache_dir
-from parcels.kernels.error import ErrorCode, recovery_map as recovery_base_map
-from parcels.field import FieldSamplingError
-from parcels.loggers import logger
+from parcels.tools.error import ErrorCode, recovery_map as recovery_base_map
+from parcels.field import FieldSamplingError, Field, SummedField, NestedField
+from parcels.tools.loggers import logger
 from parcels.kernels.advection import AdvectionRK4_3D
 from os import path, remove
 import numpy as np
@@ -51,11 +51,22 @@ class Kernel(object):
                  funccode=None, py_ast=None, funcvars=None, c_include=""):
         self.fieldset = fieldset
         self.ptype = ptype
+        self._lib = None
 
         # Derive meta information from pyfunc, if not given
         self.funcname = funcname or pyfunc.__name__
         if pyfunc is AdvectionRK4_3D:
-            logger.warning_once('Note that positive vertical velocity is assumed DOWNWARD by AdvectionRK4_3D')
+            warning = False
+            if isinstance(fieldset.W, Field) and fieldset.W.creation_log != 'from_nemo' and \
+               fieldset.W._scaling_factor is not None and fieldset.W._scaling_factor > 0:
+                warning = True
+            if type(fieldset.W) in [SummedField, NestedField]:
+                for f in fieldset.W:
+                    if f.creation_log != 'from_nemo' and f._scaling_factor is not None and f._scaling_factor > 0:
+                        warning = True
+            if warning:
+                logger.warning_once('Note that in AdvectionRK4_3D, vertical velocity is assumed positive towards increasing z.\n'
+                                    '         If z increases downward and w is positive upward you can re-orient it downwards by setting fieldset.W.set_scaling_factor(-1.)')
         if funcvars is not None:
             self.funcvars = funcvars
         elif hasattr(pyfunc, '__code__'):
@@ -84,24 +95,28 @@ class Kernel(object):
             self.pyfunc = user_ctx[self.funcname]
         else:
             self.pyfunc = pyfunc
+        assert len(inspect.getargspec(self.pyfunc).args) == 3, \
+            'Since Parcels v2.0, kernels do only take 3 arguments: particle, fieldset, time !! AND !! Argument order in field interpolation is time, depth, lat, lon.'
+
         self.name = "%s%s" % (ptype.name, self.funcname)
 
         # Generate the kernel function and add the outer loop
         if self.ptype.uses_jit:
             kernelgen = KernelGenerator(fieldset, ptype)
-            self.field_args = kernelgen.field_args
             kernel_ccode = kernelgen.generate(deepcopy(self.py_ast),
                                               self.funcvars)
             self.field_args = kernelgen.field_args
-            if 'UV' in self.field_args:
-                fieldset = self.field_args['UV'].fieldset
-                for f in ['U', 'V', 'cosU', 'sinU', 'cosV', 'sinV']:
-                    if f not in self.field_args:
+            self.vector_field_args = kernelgen.vector_field_args
+            fieldset = self.fieldset
+            for fname in self.vector_field_args:
+                f = getattr(fieldset, fname)
+                Wname = f.W.name if f.W else 'not_defined'
+                for sF in [f.U.name, f.V.name, Wname]:
+                    if sF not in self.field_args:
                         try:
-                            self.field_args[f] = getattr(fieldset, f)
+                            self.field_args[sF] = getattr(fieldset, sF)
                         except:
                             continue
-                del self.field_args['UV']
             self.const_args = kernelgen.const_args
             loopgen = LoopGenerator(fieldset, ptype)
             if path.isfile(c_include):
@@ -116,7 +131,6 @@ class Kernel(object):
             self.src_file = "%s.c" % basename
             self.lib_file = "%s.%s" % (basename, 'dll' if platform == 'win32' else 'so')
             self.log_file = "%s.log" % basename
-        self._lib = None
 
     def __del__(self):
         # Clean-up the in-memory dynamic linked libraries.
@@ -164,6 +178,9 @@ class Kernel(object):
 
     def execute_jit(self, pset, endtime, dt):
         """Invokes JIT engine to perform the core update loop"""
+        if len(pset.particles) > 0:
+            assert pset.fieldset.gridset.size == len(pset.particles[0].xi), \
+                'FieldSet has different amount of grids than Particle.xi. Have you added Fields after creating the ParticleSet?'
         for g in pset.fieldset.gridset.grids:
             g.cstruct = None  # This force to point newly the grids from Python to C
         # Make a copy of the transposed array to enforce
@@ -187,7 +204,12 @@ class Kernel(object):
     def execute_python(self, pset, endtime, dt):
         """Performs the core update loop via Python"""
         sign_dt = np.sign(dt)
+
+        # back up variables in case of ErrorCode.Repeat
+        p_var_back = {}
+
         for p in pset.particles:
+            ptype = p.getPType()
             # Don't execute particles that aren't started yet
             sign_end_part = np.sign(endtime - p.time)
             if (sign_end_part != sign_dt) and (dt != 0):
@@ -196,8 +218,11 @@ class Kernel(object):
             # Compute min/max dt for first timestep
             dt_pos = min(abs(p.dt), abs(endtime - p.time))
             while dt_pos > 1e-6 or dt == 0:
+                for var in ptype.variables:
+                    p_var_back[var.name] = getattr(p, var.name)
                 try:
-                    res = self.pyfunc(p, pset.fieldset, p.time, sign_dt * dt_pos)
+                    p.dt = sign_dt * dt_pos
+                    res = self.pyfunc(p, pset.fieldset, p.time)
                 except FieldSamplingError as fse:
                     res = ErrorCode.ErrorOutOfBounds
                     p.exception = fse
@@ -219,8 +244,11 @@ class Kernel(object):
                     continue
                 elif res == ErrorCode.Repeat:
                     # Try again without time update
+                    for var in ptype.variables:
+                        if var.name not in ['dt', 'state']:
+                            setattr(p, var.name, p_var_back[var.name])
                     dt_pos = min(abs(p.dt), abs(endtime - p.time))
-                    continue
+                    break
                 else:
                     break  # Failure - stop time loop
 
@@ -249,15 +277,18 @@ class Kernel(object):
         # Remove all particles that signalled deletion
         remove_deleted(pset)
 
-        # Idenitify particles that threw errors
+        # Identify particles that threw errors
         error_particles = [p for p in pset.particles
-                           if p.state not in [ErrorCode.Success, ErrorCode.Repeat]]
+                           if p.state != ErrorCode.Success]
         while len(error_particles) > 0:
             # Apply recovery kernel
             for p in error_particles:
-                recovery_kernel = recovery_map[p.state]
-                p.state = ErrorCode.Success
-                recovery_kernel(p, self.fieldset, p.time, dt)
+                if p.state == ErrorCode.Repeat:
+                    p.state = ErrorCode.Success
+                else:
+                    recovery_kernel = recovery_map[p.state]
+                    p.state = ErrorCode.Success
+                    recovery_kernel(p, self.fieldset, p.time)
 
             # Remove all particles that signalled deletion
             remove_deleted(pset)
@@ -269,7 +300,7 @@ class Kernel(object):
                 self.execute_python(pset, endtime, dt)
 
             error_particles = [p for p in pset.particles
-                               if p.state not in [ErrorCode.Success, ErrorCode.Repeat]]
+                               if p.state != ErrorCode.Success]
 
     def merge(self, kernel):
         funcname = self.funcname + kernel.funcname

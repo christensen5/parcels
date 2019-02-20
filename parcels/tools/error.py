@@ -1,9 +1,9 @@
 """Collection of pre-built recovery kernels"""
 from enum import IntEnum
-import numpy as np
 
 
-__all__ = ['ErrorCode', 'KernelError', 'OutOfBoundsError', 'recovery_map']
+__all__ = ['ErrorCode', 'FieldSamplingError', 'TimeExtrapolationError',
+           'KernelError', 'OutOfBoundsError', 'recovery_map']
 
 
 class ErrorCode(IntEnum):
@@ -13,6 +13,35 @@ class ErrorCode(IntEnum):
     Error = 3
     ErrorOutOfBounds = 4
     ErrorTimeExtrapolation = 5
+
+
+class FieldSamplingError(RuntimeError):
+    """Utility error class to propagate erroneous field sampling in Scipy mode"""
+
+    def __init__(self, x, y, z, field=None):
+        self.field = field
+        self.x = x
+        self.y = y
+        self.z = z
+        message = "%s sampled at (%f, %f, %f)" % (
+            field.name if field else "Field", self.x, self.y, self.z
+        )
+        super(FieldSamplingError, self).__init__(message)
+
+
+class TimeExtrapolationError(RuntimeError):
+    """Utility error class to propagate erroneous time extrapolation sampling in Scipy mode"""
+
+    def __init__(self, time, field=None, msg='allow_time_extrapoltion'):
+        if field is not None and field.grid.time_origin and time is not None:
+            time = field.grid.time_origin.fulltime(time)
+        message = "%s sampled outside time domain at time %s." % (
+            field.name if field else "Field", time)
+        if msg == 'allow_time_extrapoltion':
+            message += " Try setting allow_time_extrapolation to True"
+        elif msg == 'show_time':
+            message += " Try explicitly providing a 'show_time'"
+        super(TimeExtrapolationError, self).__init__(message)
 
 
 class KernelError(RuntimeError):
@@ -29,13 +58,12 @@ class KernelError(RuntimeError):
 
 
 def parse_particletime(time, fieldset):
-    if fieldset is not None and fieldset.U.grid.time_origin != 0:
-        # TODO assuming that error was thrown on U field
-        time = fieldset.U.grid.time_origin + np.timedelta64(int(time), 's')
+    if fieldset is not None and fieldset.time_origin:
+        time = fieldset.time_origin.fulltime(time)
     return time
 
 
-def recovery_kernel_error(particle, fieldset, time, dt):
+def recovery_kernel_error(particle, fieldset, time):
     """Default error kernel that throws exception"""
     msg = "Error: %s" % particle.exception if particle.exception else None
     raise KernelError(particle, fieldset=fieldset, msg=msg)
@@ -67,7 +95,7 @@ class OutOfTimeError(KernelError):
         super(OutOfTimeError, self).__init__(particle, fieldset=fieldset, msg=message)
 
 
-def recovery_kernel_out_of_bounds(particle, fieldset, time, dt):
+def recovery_kernel_out_of_bounds(particle, fieldset, time):
     """Default sampling error kernel that throws OutOfBoundsError"""
     if particle.exception is None:
         # TODO: JIT does not yet provide the context that created
@@ -78,7 +106,7 @@ def recovery_kernel_out_of_bounds(particle, fieldset, time, dt):
         raise OutOfBoundsError(particle, fieldset, error.x, error.y, error.z)
 
 
-def recovery_kernel_time_extrapolation(particle, fieldset, time, dt):
+def recovery_kernel_time_extrapolation(particle, fieldset, time):
     """Default sampling error kernel that throws OutOfTimeError"""
     raise OutOfTimeError(particle, fieldset)
 
