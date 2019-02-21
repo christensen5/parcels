@@ -212,7 +212,7 @@ class Kernel(object):
                     p_var_back[var.name] = getattr(p, var.name)
                 try:
                     p.dt = sign_dt * dt_pos
-                    res = self.pyfunc(p, pset.fieldset, p.time)
+                    res = self.pyfunc(p, pset.fieldset, p.time, **pset.kernel_kwargs)
                 except FieldSamplingError as fse:
                     res = ErrorCode.ErrorOutOfBounds
                     p.exception = fse
