@@ -28,7 +28,6 @@ class Grid(object):
         self.lon = lon
         self.lat = lat
         self.time = np.zeros(1, dtype=np.float64) if time is None else time
-        self.time_full = self.time  # needed for deferred_loaded Fields
         if not self.lon.dtype == np.float32:
             logger.warning_once("Casting lon data to np.float32")
             self.lon = self.lon.astype(np.float32)
@@ -39,6 +38,7 @@ class Grid(object):
             assert isinstance(self.time[0], (np.integer, np.floating, float, int)), 'Time vector must be an array of int or floats'
             logger.warning_once("Casting time data to np.float64")
             self.time = self.time.astype(np.float64)
+        self.time_full = self.time  # needed for deferred_loaded Fields
         self.time_origin = TimeConverter() if time_origin is None else time_origin
         assert isinstance(self.time_origin, TimeConverter), 'time_origin needs to be a TimeConverter object'
         self.mesh = mesh
@@ -51,6 +51,8 @@ class Grid(object):
         self.defer_load = False
         self.lonlat_minmax = np.array([np.nanmin(lon), np.nanmax(lon), np.nanmin(lat), np.nanmax(lat)], dtype=np.float32)
         self.periods = 0
+        self.load_chunk = []
+        self.chunk_info = None
 
     @staticmethod
     def create_grid(lon, lat, depth, time, time_origin, mesh, **kwargs):
@@ -82,6 +84,8 @@ class Grid(object):
             _fields_ = [('xdim', c_int), ('ydim', c_int), ('zdim', c_int),
                         ('tdim', c_int), ('z4d', c_int),
                         ('mesh_spherical', c_int), ('zonal_periodic', c_int),
+                        ('chunk_info', POINTER(c_int)),
+                        ('load_chunk', POINTER(c_int)),
                         ('tfull_min', c_double), ('tfull_max', c_double), ('periods', POINTER(c_int)),
                         ('lonlat_minmax', POINTER(c_float)),
                         ('lon', POINTER(c_float)), ('lat', POINTER(c_float)),
@@ -96,6 +100,8 @@ class Grid(object):
             self.cstruct = CStructuredGrid(self.xdim, self.ydim, self.zdim,
                                            self.tdim, self.z4d,
                                            self.mesh == 'spherical', self.zonal_periodic,
+                                           (c_int * len(self.chunk_info))(*self.chunk_info),
+                                           self.load_chunk.ctypes.data_as(POINTER(c_int)),
                                            self.time_full[0], self.time_full[-1], pointer(self.periods),
                                            self.lonlat_minmax.ctypes.data_as(POINTER(c_float)),
                                            self.lon.ctypes.data_as(POINTER(c_float)),
@@ -121,7 +127,7 @@ class Grid(object):
         assert isinstance(grid_new.time_origin, type(self.time_origin)), 'time_origin of new and old grids must be either both None or both a date'
         if self.time_origin:
             grid_new.time = grid_new.time + self.time_origin.reltime(grid_new.time_origin)
-        if len(grid_new.time) is not 1:
+        if len(grid_new.time) != 1:
             raise RuntimeError('New FieldSet needs to have only one snapshot')
         if grid_new.time > self.time[-1]:  # forward in time, so appending at end
             self.time = np.concatenate((self.time[1:], grid_new.time))
@@ -140,8 +146,28 @@ class Grid(object):
         dx = np.where(dx > 180, dx-360, dx)
         self.zonal_periodic = sum(dx) > 359.9
 
+    def add_Sdepth_periodic_halo(self, zonal, meridional, halosize):
+        if zonal:
+            if len(self.depth.shape) == 3:
+                self.depth = np.concatenate((self.depth[:, :, -halosize:], self.depth,
+                                             self.depth[:, :, 0:halosize]), axis=len(self.depth.shape) - 1)
+                assert self.depth.shape[2] == self.xdim, "Third dim must be x."
+            else:
+                self.depth = np.concatenate((self.depth[:, :, :, -halosize:], self.depth,
+                                             self.depth[:, :, :, 0:halosize]), axis=len(self.depth.shape) - 1)
+                assert self.depth.shape[3] == self.xdim, "Fourth dim must be x."
+        if meridional:
+            if len(self.depth.shape) == 3:
+                self.depth = np.concatenate((self.depth[:, -halosize:, :], self.depth,
+                                             self.depth[:, 0:halosize, :]), axis=len(self.depth.shape) - 2)
+                assert self.depth.shape[1] == self.ydim, "Second dim must be y."
+            else:
+                self.depth = np.concatenate((self.depth[:, :, -halosize:, :], self.depth,
+                                             self.depth[:, :, 0:halosize, :]), axis=len(self.depth.shape) - 2)
+                assert self.depth.shape[2] == self.ydim, "Third dim must be y."
+
     def computeTimeChunk(self, f, time, signdt):
-        nextTime_loc = np.infty * signdt
+        nextTime_loc = np.infty if signdt >= 0 else -np.infty
         periods = self.periods.value if isinstance(self.periods, c_int) else self.periods
         if self.update_status == 'not_updated':
             if self.ti >= 0:
@@ -223,6 +249,8 @@ class RectilinearGrid(Grid):
             self.ydim = self.lat.size
             self.meridional_halo = halosize
         self.lonlat_minmax = np.array([np.nanmin(self.lon), np.nanmax(self.lon), np.nanmin(self.lat), np.nanmax(self.lat)], dtype=np.float32)
+        if isinstance(self, RectilinearSGrid):
+            self.add_Sdepth_periodic_halo(zonal, meridional, halosize)
 
 
 class RectilinearZGrid(RectilinearGrid):
@@ -352,6 +380,8 @@ class CurvilinearGrid(Grid):
             self.xdim = self.lon.shape[1]
             self.ydim = self.lat.shape[0]
             self.meridional_halo = halosize
+        if isinstance(self, CurvilinearSGrid):
+            self.add_Sdepth_periodic_halo(zonal, meridional, halosize)
 
 
 class CurvilinearZGrid(CurvilinearGrid):

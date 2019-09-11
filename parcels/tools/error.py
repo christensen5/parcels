@@ -1,12 +1,11 @@
 """Collection of pre-built recovery kernels"""
-from enum import IntEnum
 
 
-__all__ = ['ErrorCode', 'FieldSamplingError', 'TimeExtrapolationError',
+__all__ = ['ErrorCode', 'FieldSamplingError', 'FieldOutOfBoundError', 'TimeExtrapolationError',
            'KernelError', 'OutOfBoundsError', 'recovery_map']
 
 
-class ErrorCode(IntEnum):
+class ErrorCode(object):
     Success = 0
     Repeat = 1
     Delete = 2
@@ -29,6 +28,20 @@ class FieldSamplingError(RuntimeError):
         super(FieldSamplingError, self).__init__(message)
 
 
+class FieldOutOfBoundError(RuntimeError):
+    """Utility error class to propagate out-of-bound field sampling in Scipy mode"""
+
+    def __init__(self, x, y, z, field=None):
+        self.field = field
+        self.x = x
+        self.y = y
+        self.z = z
+        message = "%s sampled out-of-bound, at (%f, %f, %f)" % (
+            field.name if field else "Field", self.x, self.y, self.z
+        )
+        super(FieldOutOfBoundError, self).__init__(message)
+
+
 class TimeExtrapolationError(RuntimeError):
     """Utility error class to propagate erroneous time extrapolation sampling in Scipy mode"""
 
@@ -41,6 +54,8 @@ class TimeExtrapolationError(RuntimeError):
             message += " Try setting allow_time_extrapolation to True"
         elif msg == 'show_time':
             message += " Try explicitly providing a 'show_time'"
+        else:
+            message += msg + " Try setting allow_time_extrapolation to True"
         super(TimeExtrapolationError, self).__init__(message)
 
 

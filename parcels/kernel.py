@@ -1,7 +1,7 @@
 from parcels.codegenerator import KernelGenerator, LoopGenerator
 from parcels.compiler import get_cache_dir
 from parcels.tools.error import ErrorCode, recovery_map as recovery_base_map
-from parcels.field import FieldSamplingError, Field, SummedField, NestedField
+from parcels.field import FieldOutOfBoundError, Field, SummedField, NestedField, VectorField
 from parcels.tools.loggers import logger
 from parcels.kernels.advection import AdvectionRK4_3D
 from os import path, remove
@@ -10,7 +10,7 @@ import numpy.ctypeslib as npct
 import time
 from ctypes import c_int, c_float, c_double, c_void_p, byref
 import _ctypes
-from sys import platform
+from sys import platform, version_info
 from ast import parse, FunctionDef, Module
 import inspect
 from copy import deepcopy
@@ -18,6 +18,10 @@ import re
 from hashlib import md5
 import math  # noqa
 import random  # noqa
+try:
+    from mpi4py import MPI
+except:
+    MPI = None
 
 
 __all__ = ['Kernel']
@@ -95,7 +99,13 @@ class Kernel(object):
             self.pyfunc = user_ctx[self.funcname]
         else:
             self.pyfunc = pyfunc
-        assert len(inspect.getargspec(self.pyfunc).args) == 3, \
+
+        if version_info[0] < 3:
+            numkernelargs = len(inspect.getargspec(self.pyfunc).args)
+        else:
+            numkernelargs = len(inspect.getfullargspec(self.pyfunc).args)
+
+        assert numkernelargs == 3, \
             'Since Parcels v2.0, kernels do only take 3 arguments: particle, fieldset, time !! AND !! Argument order in field interpolation is time, depth, lat, lon.'
 
         self.name = "%s%s" % (ptype.name, self.funcname)
@@ -108,15 +118,12 @@ class Kernel(object):
             self.field_args = kernelgen.field_args
             self.vector_field_args = kernelgen.vector_field_args
             fieldset = self.fieldset
-            for fname in self.vector_field_args:
-                f = getattr(fieldset, fname)
-                Wname = f.W.name if f.W else 'not_defined'
-                for sF in [f.U.name, f.V.name, Wname]:
-                    if sF not in self.field_args:
-                        try:
-                            self.field_args[sF] = getattr(fieldset, sF)
-                        except:
-                            continue
+            for f in self.vector_field_args.values():
+                Wname = f.W.ccode_name if f.W else 'not_defined'
+                for sF_name, sF_component in zip([f.U.ccode_name, f.V.ccode_name, Wname], ['U', 'V', 'W']):
+                    if sF_name not in self.field_args:
+                        if sF_name != 'not_defined':
+                            self.field_args[sF_name] = getattr(f, sF_component)
             self.const_args = kernelgen.const_args
             loopgen = LoopGenerator(fieldset, ptype)
             if path.isfile(c_include):
@@ -126,8 +133,15 @@ class Kernel(object):
                 c_include_str = c_include
             self.ccode = loopgen.generate(self.funcname, self.field_args, self.const_args,
                                           kernel_ccode, c_include_str)
+            if MPI:
+                mpi_comm = MPI.COMM_WORLD
+                mpi_rank = mpi_comm.Get_rank()
+                basename = path.join(get_cache_dir(), self._cache_key) if mpi_rank == 0 else None
+                basename = mpi_comm.bcast(basename, root=0)
+                basename = basename + "_%d" % mpi_rank
+            else:
+                basename = path.join(get_cache_dir(), "%s_0" % self._cache_key)
 
-            basename = path.join(get_cache_dir(), self._cache_key)
             self.src_file = "%s.c" % basename
             self.lib_file = "%s.%s" % (basename, 'dll' if platform == 'win32' else 'so')
             self.log_file = "%s.log" % basename
@@ -160,7 +174,15 @@ class Kernel(object):
         # Python's ctype does not deal in any sort of manner well with dynamic linked libraries on this OS.
         if path.isfile(self.lib_file):
             [remove(s) for s in [self.src_file, self.lib_file, self.log_file]]
-            basename = path.join(get_cache_dir(), self._cache_key)
+            if MPI:
+                mpi_comm = MPI.COMM_WORLD
+                mpi_rank = mpi_comm.Get_rank()
+                basename = path.join(get_cache_dir(), self._cache_key) if mpi_rank == 0 else None
+                basename = mpi_comm.bcast(basename, root=0)
+                basename = basename + "_%d" % mpi_rank
+            else:
+                basename = path.join(get_cache_dir(), "%s_0" % self._cache_key)
+
             self.src_file = "%s.c" % basename
             self.lib_file = "%s.%s" % (basename, 'dll' if platform == 'win32' else 'so')
             self.log_file = "%s.log" % basename
@@ -185,16 +207,27 @@ class Kernel(object):
             g.cstruct = None  # This force to point newly the grids from Python to C
         # Make a copy of the transposed array to enforce
         # C-contiguous memory layout for JIT mode.
-        for f in self.field_args.values():
-            if not f.data.flags.c_contiguous:
-                f.data = f.data.copy()
+        for f in pset.fieldset.get_fields():
+            if type(f) in [VectorField, NestedField, SummedField]:
+                continue
+            if f in self.field_args.values():
+                f.chunk_data()
+            else:
+                for block_id in range(len(f.data_chunks)):
+                    f.data_chunks[block_id] = None
+
         for g in pset.fieldset.gridset.grids:
+            if len(g.load_chunk) > 0:  # not the case if a field in not called in the kernel
+                g.load_chunk = np.where(g.load_chunk > 0, 3, g.load_chunk)
+                if not g.load_chunk.flags.c_contiguous:
+                    g.load_chunk = g.load_chunk.copy()
             if not g.depth.flags.c_contiguous:
                 g.depth = g.depth.copy()
             if not g.lon.flags.c_contiguous:
                 g.lon = g.lon.copy()
             if not g.lat.flags.c_contiguous:
                 g.lat = g.lat.copy()
+
         fargs = [byref(f.ctypes_struct) for f in self.field_args.values()]
         fargs += [c_float(f) for f in self.const_args.values()]
         particle_data = pset._particle_data.ctypes.data_as(c_void_p)
@@ -207,6 +240,11 @@ class Kernel(object):
 
         # back up variables in case of ErrorCode.Repeat
         p_var_back = {}
+
+        for f in self.fieldset.get_fields():
+            if type(f) in [VectorField, NestedField, SummedField]:
+                continue
+            f.data = np.array(f.data)
 
         for p in pset.particles:
             ptype = p.getPType()
@@ -223,7 +261,7 @@ class Kernel(object):
                 try:
                     p.dt = sign_dt * dt_pos
                     res = self.pyfunc(p, pset.fieldset, p.time)
-                except FieldSamplingError as fse:
+                except FieldOutOfBoundError as fse:
                     res = ErrorCode.ErrorOutOfBounds
                     p.exception = fse
                 except Exception as e:

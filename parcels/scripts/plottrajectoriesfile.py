@@ -51,14 +51,14 @@ def plotTrajectoriesFile(filename, mode='2d', tracerfile=None, tracerfield='P',
         record = pfile.variables[recordedvar]
     pfile.close()
 
-    if tracerfile is not None and mode is not 'hist2d':
+    if tracerfile is not None and mode != 'hist2d':
         tracerfld = Field.from_netcdf(tracerfile, tracerfield, {'lon': tracerlon, 'lat': tracerlat})
         plt, fig, ax, cartopy = plotfield(tracerfld)
         if plt is None:
             return  # creating axes was not possible
         titlestr = ' and ' + tracerfield
     else:
-        spherical = False if mode is '3d' or mesh == 'flat' else True
+        spherical = False if mode == '3d' or mesh == 'flat' else True
         plt, fig, ax, cartopy = create_parcelsfig_axis(spherical=spherical)
         if plt is None:
             return  # creating axes was not possible
